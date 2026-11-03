@@ -249,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             if not raw or offset+len(raw)>row['size']: raise Problem(400,'Invalid chunk size.')
             with target.open('ab') as f: f.write(raw); f.flush()
             self.reply({'offset':offset+len(raw)}); return
-        data=self.js()
+        data=self.js(limit=10*1024*1024 if path=='/api/gallery/stage' else 65536)
         if path=='/api/invite':
             self.auth(True)
             address=data.get('address',f'http://{self.s.ips[0]}:{self.server.port}')

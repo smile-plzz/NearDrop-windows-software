@@ -249,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             if not raw or offset+len(raw)>row['size']: raise Problem(400,'Invalid chunk size.')
             with target.open('ab') as f: f.write(raw); f.flush()
             self.reply({'offset':offset+len(raw)}); return
-        data=self.js(limit=10*1024*1024 if path=='/api/gallery/stage' else 65536)
+        data=self.js()
         if path=='/api/invite':
             self.auth(True)
             address=data.get('address',f'http://{self.s.ips[0]}:{self.server.port}')
@@ -293,7 +293,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.s.db.execute('DELETE FROM files WHERE id=?',(row['id'],)); self.s.db.commit()
             self.reply({'ok':True}); return
         if path=='/api/gallery/stage':
-            items=data.get('items',[])
+            payload=self.js(limit=10*1024*1024)
+            items=payload.get('items',[])
             if not isinstance(items,list): raise Problem(400,'Invalid items list.')
             for it in items[:500]:
                 name=safe_name(it.get('name','Media'))
@@ -307,14 +308,14 @@ class Handler(BaseHTTPRequestHandler):
             self.s.db.commit()
             self.reply({'ok':True,'count':len(items)}); return
         if path=='/api/gallery/unstage':
-            file_id=data.get('id')
+            data=self.js(); file_id=data.get('id')
             if file_id:
                 self.s.db.execute('DELETE FROM staged_media WHERE id=? AND (session_id=? OR ?)',(file_id,token,session['host']))
             else:
                 self.s.db.execute('DELETE FROM staged_media WHERE session_id=? OR ?',(token,session['host']))
             self.s.db.commit(); self.reply({'ok':True}); return
         if path=='/api/gallery/request':
-            file_id=str(data.get('id',''))
+            data=self.js(); file_id=str(data.get('id',''))
             row=self.s.db.execute('SELECT * FROM staged_media WHERE id=?',(file_id,)).fetchone()
             if not row:
                 f_row=self.s.db.execute('SELECT * FROM files WHERE id=? AND complete=1',(file_id,)).fetchone()

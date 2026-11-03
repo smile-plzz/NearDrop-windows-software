@@ -72,4 +72,75 @@ class Integration(unittest.TestCase):
         _,invite,_=self.call('/api/invite',{});token=invite['url'].split('#pair=')[1];self.s.invites[token]['expires']=0
         self.assertEqual(self.call('/api/pair',{'token':token},cookie='')[0],410)
         key=self.cookie.split('=',1)[1];self.s.sessions[key]['expires']=0;self.assertEqual(self.call('/api/state')[0],401)
+    def test_gallery_and_media_streaming(self):
+        # 1. Upload an image from laptop
+        img_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4'
+        local_id = self.upload('snapshot.png', img_data)
+        
+        # Check /view/ endpoint inline response
+        status, view_bytes, headers = self.call('/view/' + local_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(view_bytes, img_data)
+        self.assertEqual(headers.get('Content-Type'), 'image/png')
+        self.assertIn('inline', headers.get('Content-Disposition', ''))
+
+        # Check /api/gallery includes snapshot.png as local image
+        status, gal_data, _ = self.call('/api/gallery')
+        self.assertEqual(status, 200)
+        items = gal_data['gallery']
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['id'], local_id)
+        self.assertEqual(items[0]['is_staged'], False)
+        self.assertEqual(items[0]['type'], 'image')
+
+        # 2. Pair phone and stage remote media
+        phone, _ = self.phone()
+        stage_item = {
+            'id': 'staged_001',
+            'name': 'vacation.jpg',
+            'size': 45678,
+            'media_date': 1729000000,
+            'mime_type': 'image/jpeg',
+            'thumb': 'data:image/webp;base64,fake_thumb_data'
+        }
+        status, stage_res, _ = self.call('/api/gallery/stage', {'items': [stage_item]}, cookie=phone)
+        self.assertEqual(status, 200)
+        self.assertEqual(stage_res['count'], 1)
+
+        # Check /api/gallery now returns both local and staged
+        status, gal_data, _ = self.call('/api/gallery')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(gal_data['gallery']), 2)
+        staged_entry = next(x for x in gal_data['gallery'] if x['id'] == 'staged_001')
+        self.assertEqual(staged_entry['is_staged'], True)
+        self.assertEqual(staged_entry['name'], 'vacation.jpg')
+
+        # 3. PC requests download of staged file
+        status, req_res, _ = self.call('/api/gallery/request', {'id': 'staged_001'})
+        self.assertEqual(status, 200)
+        self.assertEqual(req_res['status'], 'pending')
+        req_id = req_res['id']
+
+        # Phone checks for pending requests
+        status, p_reqs, _ = self.call('/api/gallery/requests', cookie=phone)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(p_reqs['requests']), 1)
+        self.assertEqual(p_reqs['requests'][0]['file_id'], 'staged_001')
+
+        # Phone uploads the requested staged file
+        phone_data = b'original_high_res_photo_data'
+        status, start, _ = self.call('/api/upload/start', {'id': 'staged_001', 'name': 'vacation.jpg', 'size': len(phone_data)}, cookie=phone)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call('/api/upload/chunk?id=staged_001&offset=0', phone_data, cookie=phone, raw=True)[0], 200)
+        self.assertEqual(self.call('/api/upload/finish', {'id': 'staged_001'}, cookie=phone)[0], 200)
+
+        # Verify request status on PC is now complete
+        status, st_res, _ = self.call('/api/gallery/request-status?id=' + req_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(st_res['status'], 'complete')
+
+        # PC downloads the final file
+        status, downloaded, _ = self.call('/download/staged_001')
+        self.assertEqual(status, 200)
+        self.assertEqual(downloaded, phone_data)
 if __name__=='__main__':unittest.main(verbosity=2)

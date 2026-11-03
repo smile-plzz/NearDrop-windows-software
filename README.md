@@ -24,6 +24,8 @@ Choose files on either device. Every paired device can download completed files 
 - One-use 5-minute QR pairing links, per-device sessions, and laptop-controlled disconnection.
 - Shared text and links with explicit copying; no automatic clipboard reading.
 - Persistent received files and notes, file search, SHA-256 calculated after upload.
+- Media Gallery view with Year, Month, and Exact Date filtering, multi-criteria sorting, and Lightbox preview.
+- On-demand phone media browsing and selective downloading without upfront full transfers.
 - Open received folder and delete shared files/notes from the laptop dashboard.
 - Stop sharing from the dashboard; saved content remains on disk.
 - Fully local QR generation; no analytics, remote fonts, or runtime CDN dependencies.

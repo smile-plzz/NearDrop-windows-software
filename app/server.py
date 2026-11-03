@@ -40,6 +40,8 @@ class State:
         self.db.executescript('''PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, name TEXT, size INTEGER, created REAL, device TEXT, owner TEXT, complete INTEGER DEFAULT 0, sha256 TEXT);
         CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY, text TEXT, created REAL, device TEXT);
+        CREATE TABLE IF NOT EXISTS staged_media(id TEXT PRIMARY KEY, session_id TEXT, name TEXT, size INTEGER, media_date REAL, mime_type TEXT, thumb TEXT, created REAL, device TEXT);
+        CREATE TABLE IF NOT EXISTS download_requests(id TEXT PRIMARY KEY, file_id TEXT, session_id TEXT, requested_at REAL, status TEXT);
         ''')
         self.db.commit()
         self.sessions = {}; self.invites = {}; self.attempts = {}; self.bootstrap = secrets.token_urlsafe(32)
@@ -47,7 +49,10 @@ class State:
         # Incomplete files from a previous process cannot be authenticated for resumption.
         for row in self.db.execute('SELECT id FROM files WHERE complete=0').fetchall():
             (self.partial / row['id']).unlink(missing_ok=True)
-        self.db.execute('DELETE FROM files WHERE complete=0'); self.db.commit()
+        self.db.execute('DELETE FROM files WHERE complete=0')
+        self.db.execute('DELETE FROM staged_media')
+        self.db.execute('DELETE FROM download_requests')
+        self.db.commit()
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -89,9 +94,9 @@ class Handler(BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         if len(data) != n: raise Problem(400,'Transfer interrupted. Retry to resume.')
         return data
-    def js(self):
+    def js(self, limit=65536):
         try:
-            value = json.loads(self.body())
+            value = json.loads(self.body(limit=limit))
             if not isinstance(value,dict): raise ValueError()
             return value
         except (ValueError, UnicodeError): raise Problem(400,'Invalid request.')
@@ -142,7 +147,50 @@ class Handler(BaseHTTPRequestHandler):
             if not info or info['expires'] < time.time(): raise Problem(410,'Pairing link expired. Create a new one.')
             output = io.BytesIO(); segno.make(info['url']).save(output,kind='svg',scale=7,border=3)
             raw = output.getvalue(); self.headers_out(200,'image/svg+xml',len(raw)); self.wfile.write(raw); return
-        if path.startswith('/download/'):
+        if path == '/api/gallery':
+            with self.s.lock:
+                active_sessions = {k for k, v in self.s.sessions.items() if v['expires'] > time.time()}
+                if active_sessions:
+                    q_marks = ','.join('?' * len(active_sessions))
+                    self.s.db.execute(f'DELETE FROM staged_media WHERE session_id NOT IN ({q_marks})', list(active_sessions))
+                else:
+                    self.s.db.execute('DELETE FROM staged_media')
+                self.s.db.commit()
+                completed = []
+                for r in self.s.db.execute('SELECT id,name,size,created,device,sha256 FROM files WHERE complete=1 ORDER BY created DESC'):
+                    mime, _ = mimetypes.guess_type(r['name'])
+                    mime = mime or 'application/octet-stream'
+                    ext = Path(r['name']).suffix.lower()
+                    is_img = mime.startswith('image/') or ext in ('.jpg','.jpeg','.png','.gif','.webp','.svg','.bmp','.heic','.heif','.avif')
+                    is_vid = mime.startswith('video/') or ext in ('.mp4','.webm','.mov','.mkv','.avi','.m4v')
+                    if is_img or is_vid:
+                        completed.append({
+                            'id': r['id'],
+                            'name': r['name'],
+                            'size': r['size'],
+                            'created': r['created'],
+                            'media_date': r['created'],
+                            'device': r['device'],
+                            'sha256': r['sha256'],
+                            'mime_type': mime,
+                            'is_staged': False,
+                            'type': 'video' if is_vid else 'image'
+                        })
+                staged = [dict(r) | {'is_staged': True, 'type': 'video' if (r['mime_type'] or '').startswith('video/') else 'image'}
+                          for r in self.s.db.execute('SELECT id,name,size,created,media_date,mime_type,thumb,device FROM staged_media ORDER BY media_date DESC')]
+            self.reply({'gallery': completed + staged}); return
+        if path == '/api/gallery/requests':
+            with self.s.lock:
+                rows = self.s.db.execute("SELECT dr.id as req_id, dr.file_id, sm.name, sm.size FROM download_requests dr JOIN staged_media sm ON dr.file_id = sm.id WHERE dr.session_id=? AND dr.status='pending'", (token,)).fetchall()
+            self.reply({'requests': [dict(r) for r in rows]}); return
+        if path == '/api/gallery/request-status':
+            req_id = parse_qs(u.query).get('id', [''])[0]
+            with self.s.lock:
+                row = self.s.db.execute('SELECT * FROM download_requests WHERE id=? OR file_id=?', (req_id, req_id)).fetchone()
+            if not row: raise Problem(404, 'Request not found.')
+            self.reply({'id': row['id'], 'file_id': row['file_id'], 'status': row['status']}); return
+        if path.startswith('/download/') or path.startswith('/view/'):
+            inline = path.startswith('/view/')
             file_id = path.split('/')[-1]
             with self.s.lock: row = self.s.db.execute('SELECT * FROM files WHERE id=? AND complete=1',(file_id,)).fetchone()
             if not row: raise Problem(404,'File is no longer available.')
@@ -154,10 +202,12 @@ class Handler(BaseHTTPRequestHandler):
                 start=int(match[1]); end=min(int(match[2]) if match[2] else end,end)
                 if start > end or start >= size: raise Problem(416,'Invalid download range.')
                 status=206
-            extra={'Content-Disposition':"attachment; filename*=UTF-8''"+quote(row['name']), 'Accept-Ranges':'bytes'}
+            mime = mimetypes.guess_type(row['name'])[0] or 'application/octet-stream'
+            disp = 'inline' if inline else 'attachment'
+            extra={'Content-Disposition':f"{disp}; filename*=UTF-8''"+quote(row['name']), 'Accept-Ranges':'bytes'}
             if status==206: extra['Content-Range']=f'bytes {start}-{end}/{size}'
             with target.open('rb') as f:
-                self.headers_out(status,'application/octet-stream',end-start+1,extra)
+                self.headers_out(status, mime if inline else 'application/octet-stream', end-start+1, extra)
                 f.seek(start); remaining=end-start+1
                 while remaining:
                     data=f.read(min(CHUNK,remaining))
@@ -199,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             if not raw or offset+len(raw)>row['size']: raise Problem(400,'Invalid chunk size.')
             with target.open('ab') as f: f.write(raw); f.flush()
             self.reply({'offset':offset+len(raw)}); return
-        data=self.js()
+        data=self.js(limit=10*1024*1024 if path=='/api/gallery/stage' else 65536)
         if path=='/api/invite':
             self.auth(True)
             address=data.get('address',f'http://{self.s.ips[0]}:{self.server.port}')
@@ -218,7 +268,9 @@ class Handler(BaseHTTPRequestHandler):
             reserved=sum(r['size']-(self.s.partial/r['id']).stat().st_size for r in self.s.db.execute('SELECT id,size FROM files WHERE complete=0'))
             if size+reserved+100*1024**2>shutil.disk_usage(self.s.root).free: raise Problem(507,'Not enough space on the laptop.')
             if self.s.db.execute('SELECT COUNT(*) FROM files WHERE complete=0').fetchone()[0]>=64: raise Problem(429,'Too many unfinished uploads. Cancel a transfer first.')
-            file_id=secrets.token_hex(16); (self.s.partial/file_id).touch()
+            req_file_id = re.sub(r'[^a-zA-Z0-9_-]', '', str(data.get('id','')))[:64]
+            file_id = req_file_id if req_file_id and not (self.s.partial/req_file_id).exists() else secrets.token_hex(16)
+            (self.s.partial/file_id).touch()
             self.s.db.execute('INSERT INTO files(id,name,size,created,device,owner) VALUES(?,?,?,?,?,?)',(file_id,name,size,time.time(),session['name'],token)); self.s.db.commit()
             self.reply({'id':file_id,'offset':0,'complete':False}); return
         if path=='/api/upload/finish':
@@ -229,7 +281,10 @@ class Handler(BaseHTTPRequestHandler):
             if target.stat().st_size!=row['size']: raise Problem(409,'Upload is incomplete. Retry to resume.')
             with target.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
             target.replace(self.s.files/(row['id']+'_'+row['name']))
-            self.s.db.execute('UPDATE files SET complete=1,sha256=? WHERE id=?',(digest,row['id'])); self.s.db.commit()
+            self.s.db.execute('UPDATE files SET complete=1,sha256=? WHERE id=?',(digest,row['id']))
+            self.s.db.execute("UPDATE download_requests SET status='complete', file_id=? WHERE file_id=? OR id=?", (row['id'], row['id'], row['id']))
+            self.s.db.execute('DELETE FROM staged_media WHERE id=?', (row['id'],))
+            self.s.db.commit()
             self.reply({'ok':True,'sha256':digest}); return
         if path=='/api/upload/cancel':
             row=self.s.db.execute('SELECT id FROM files WHERE id=? AND complete=0 AND owner=?',(data.get('id'),token)).fetchone()
@@ -237,12 +292,49 @@ class Handler(BaseHTTPRequestHandler):
                 (self.s.partial/row['id']).unlink(missing_ok=True)
                 self.s.db.execute('DELETE FROM files WHERE id=?',(row['id'],)); self.s.db.commit()
             self.reply({'ok':True}); return
+        if path=='/api/gallery/stage':
+            items=data.get('items',[])
+            if not isinstance(items,list): raise Problem(400,'Invalid items list.')
+            for it in items[:500]:
+                name=safe_name(it.get('name','Media'))
+                size=max(0,int(it.get('size',0)))
+                media_date=float(it.get('media_date',time.time()))
+                mime=str(it.get('mime_type',''))[:100]
+                thumb=str(it.get('thumb',''))[:150000]
+                item_id=re.sub(r'[^a-zA-Z0-9_-]','',str(it.get('id',''))[:64]) or secrets.token_hex(16)
+                self.s.db.execute('INSERT OR REPLACE INTO staged_media(id,session_id,name,size,media_date,mime_type,thumb,created,device) VALUES(?,?,?,?,?,?,?,?,?)',
+                                  (item_id,token,name,size,media_date,mime,thumb,time.time(),session['name']))
+            self.s.db.commit()
+            self.reply({'ok':True,'count':len(items)}); return
+        if path=='/api/gallery/unstage':
+            file_id=data.get('id')
+            if file_id:
+                self.s.db.execute('DELETE FROM staged_media WHERE id=? AND (session_id=? OR ?)',(file_id,token,session['host']))
+            else:
+                self.s.db.execute('DELETE FROM staged_media WHERE session_id=? OR ?',(token,session['host']))
+            self.s.db.commit(); self.reply({'ok':True}); return
+        if path=='/api/gallery/request':
+            file_id=str(data.get('id',''))
+            row=self.s.db.execute('SELECT * FROM staged_media WHERE id=?',(file_id,)).fetchone()
+            if not row:
+                f_row=self.s.db.execute('SELECT * FROM files WHERE id=? AND complete=1',(file_id,)).fetchone()
+                if f_row: self.reply({'ok':True,'status':'complete','file_id':file_id}); return
+                raise Problem(404,'Staged media not found.')
+            req_id=secrets.token_hex(16)
+            self.s.db.execute('INSERT OR REPLACE INTO download_requests(id,file_id,session_id,requested_at,status) VALUES(?,?,?,?,?)',
+                              (req_id,file_id,row['session_id'],time.time(),'pending'))
+            self.s.db.commit()
+            self.reply({'ok':True,'status':'pending','id':req_id,'file_id':file_id}); return
         if path=='/api/note':
             content=str(data.get('text','')).strip()
             if not 0<len(content)<=16000: raise Problem(400,'Enter between 1 and 16,000 characters.')
             self.s.db.execute('INSERT INTO notes VALUES(?,?,?,?)',(secrets.token_hex(16),content,time.time(),session['name'])); self.s.db.commit(); self.reply({'ok':True}); return
         if path=='/api/logout':
-            self.s.sessions.pop(token,None); self.reply({'ok':True},extra={'Set-Cookie':'nd=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'}); return
+            self.s.sessions.pop(token,None)
+            self.s.db.execute('DELETE FROM staged_media WHERE session_id=?',(token,))
+            self.s.db.execute('DELETE FROM download_requests WHERE session_id=?',(token,))
+            self.s.db.commit()
+            self.reply({'ok':True},extra={'Set-Cookie':'nd=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'}); return
         self.auth(True)
         if path=='/api/delete':
             ident=data.get('id'); kind=data.get('kind')
@@ -250,12 +342,18 @@ class Handler(BaseHTTPRequestHandler):
                 row=self.s.db.execute('SELECT * FROM files WHERE id=? AND complete=1',(ident,)).fetchone()
                 if row: (self.s.files/(row['id']+'_'+row['name'])).unlink(missing_ok=True)
                 self.s.db.execute('DELETE FROM files WHERE id=? AND complete=1',(ident,))
+                self.s.db.execute('DELETE FROM staged_media WHERE id=?',(ident,))
+                self.s.db.execute('DELETE FROM download_requests WHERE file_id=?',(ident,))
             elif kind=='note': self.s.db.execute('DELETE FROM notes WHERE id=?',(ident,))
             else: raise Problem(400,'Invalid item type.')
             self.s.db.commit(); self.reply({'ok':True}); return
         if path=='/api/revoke':
             for key,val in list(self.s.sessions.items()):
-                if val['id']==data.get('id') and not val['host']: self.s.sessions.pop(key)
+                if val['id']==data.get('id') and not val['host']:
+                    self.s.sessions.pop(key)
+                    self.s.db.execute('DELETE FROM staged_media WHERE session_id=?',(key,))
+                    self.s.db.execute('DELETE FROM download_requests WHERE session_id=?',(key,))
+            self.s.db.commit()
             self.reply({'ok':True}); return
         if path=='/api/open-folder':
             if os.name=='nt': os.startfile(self.s.files)
